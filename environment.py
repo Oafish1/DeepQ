@@ -10,13 +10,16 @@ from torch import nn
 class balanceStick:
     def __init__(self):
         # Units: meters, kg, seconds
-        self.length = 1
+        self.length = 2
         self.mass = 1
         self.friction_coef = .2
         self.gravity = 9.8
         self.bounds = (-5, 5)
-        self.tickrate = 64
+        self.tickrate = 32
         self.reset()
+
+    def _get_state(self):
+        return torch.tensor([[self.x, self.angle, self.velocity]]).float()
 
     def reset(self):
         self.angle = (np.pi / 8) * (np.pi * (np.random.rand() - .5)) + (np.pi / 2)  # Tilt up to pi/8
@@ -25,7 +28,7 @@ class balanceStick:
         self.tip_ang_vel = 0  # 6 * (np.random.rand() - .5)  # -3 to 3
 
         # Return game state
-        return torch.tensor([[self.x, self.angle]]).float()
+        return self._get_state()
 
     def tick(self, force_x):
         # Apply force
@@ -61,16 +64,16 @@ class balanceStick:
         self.angle = self.angle % (2 * np.pi)
 
         # Return game state
-        return torch.tensor([[self.x, self.angle]]).float()
+        return self._get_state()
 
     def render(self, ax=None, state=None):
         if state is not None:
-            x, angle = state
+            x, angle = state[:2]
         else:
             x, angle = self.x, self.angle
 
-        x = (x, x + np.cos(angle))
-        y = (0, np.sin(angle))
+        x = (x, x + self.length * np.cos(angle))
+        y = (0, self.length * np.sin(angle))
         if ax is not None:
             ax.plot(x, y, 'g-', linewidth=3, markersize=10)
             ax.set_aspect('equal', 'box')
@@ -81,7 +84,7 @@ class balanceStick:
 
 class Agent(nn.Module):
     """Thin, simple NN model"""
-    def __init__(self, input_dim, output_dim, hidden_dim=20):
+    def __init__(self, input_dim, output_dim, hidden_dim=10):
         super().__init__()
 
         self.layers = nn.Sequential(
@@ -102,30 +105,38 @@ class Agent(nn.Module):
 if __name__ == "__main__":
     # Params
     show_preview = False
-    show_best_replay = True
+    show_best_replay = False
     best_replay_interval = 100
+    show_new_highscores = True
 
     show_training_plot = True
     show_avg_loss = True
     stat_interval = 10
 
-    show_plt = show_preview or show_best_replay or show_training_plot or show_avg_loss
+    show_plt = show_preview or show_best_replay or show_new_highscores or show_training_plot or show_avg_loss
     cli_print_interval = 50
+    save_fig = True
+
+    visualization_speedup = 3
 
     # Env setup
     env = balanceStick()
     if show_plt:
-        num_subplots = show_preview + show_best_replay + show_training_plot + show_avg_loss
+        num_subplots = show_preview + show_best_replay + show_new_highscores + show_training_plot + show_avg_loss
         fig, axs = plt.subplots(num_subplots, 1)
         fig.tight_layout()
         plt.ion()
         plt.show()
 
     # Model setup
-    model = Agent(2, 5)
+    actions = np.array([-400, -200, -100, -50, 0, 50, 100, 200, 400])
+    num_features = env._get_state().shape[1]
+    num_actions = len(actions)
+    num_hidden = 20
+    model = Agent(num_features, num_actions, num_hidden)
     model.train()
     optimizer = torch.optim.AdamW(model.parameters())
-    q_model = Agent(2, 5)
+    q_model = Agent(num_features, num_actions, num_hidden)
     q_model.eval()
 
     # Hyperparams
@@ -137,11 +148,11 @@ if __name__ == "__main__":
     batch_size = 128
     q_lr = .7
 
-    epsilon = max_epsilon
     best_ticks = []
     avg_loss = []
+    highscore = 0
+    epsilon = max_epsilon
     replay_memory = deque(maxlen=50_000)
-    task = None
 
     # epoch = -1
     # while True:
@@ -169,7 +180,6 @@ if __name__ == "__main__":
                     logit_max = torch.argmax(logits, 1)
                 else:
                     logit_max = np.random.randint(0, 5)
-                actions = np.array([-200, -100, 0, 100, 200])
                 force = actions[logit_max]
 
                 # Tick
@@ -242,9 +252,22 @@ if __name__ == "__main__":
             for state in max_tick_memory:
                 axs[plot_idx].cla()
                 env.render(ax=axs[plot_idx], state=state)
-                axs[plot_idx].set_title(f'Epoch {epoch}')
-                plt.pause(1/env.tickrate)
+                axs[plot_idx].set_title(f'Epoch {epoch} Best Run: {max_ticks}')
+                plt.pause(1/(env.tickrate * visualization_speedup))
         if show_best_replay:
+            plot_idx += 1
+
+        # Show new highscores
+        if max_ticks > highscore:
+            highscore = max_ticks
+            highscore_memory = max_tick_memory
+            if show_new_highscores:
+                for state in highscore_memory:
+                    axs[plot_idx].cla()
+                    env.render(ax=axs[plot_idx], state=state)
+                    axs[plot_idx].set_title(f'Highscore (Epoch {epoch}): {highscore}')
+                    plt.pause(1/(env.tickrate * visualization_speedup))
+        if show_new_highscores:
             plot_idx += 1
 
         # Best ticks plot
@@ -265,7 +288,11 @@ if __name__ == "__main__":
             plot_idx += 1
 
         # Average loss plot
-        avg_loss[-1] = sum(avg_loss[-1]) / len(avg_loss[-1])
+        try:
+            avg_loss[-1] = sum(avg_loss[-1]) / len(avg_loss[-1])
+        except:
+            # NA
+            avg_loss[-1] = 0
         if show_avg_loss and epoch % stat_interval == 0:
             smoothed_loss = []
             smoothed_loss.append(avg_loss[0])
@@ -275,9 +302,13 @@ if __name__ == "__main__":
             axs[plot_idx].cla()
             axs[plot_idx].plot(avg_loss, color='orange')
             axs[plot_idx].plot(range(0, len(avg_loss), 10),
-                         smoothed_loss[:-1],
-                         color='blue')
-            axs[plot_idx].set(xlabel='Epoch', ylabel='Average Loss', title='Loss')
+                               smoothed_loss[:-1],
+                               color='blue')
+            axs[plot_idx].set(xlabel='Epoch',
+                              ylabel='Average Loss',
+                              title='Loss',
+                              yscale='log')
+            axs[plot_idx].set_yscale('log')
         if show_avg_loss:
             plot_idx += 1
 
@@ -285,6 +316,9 @@ if __name__ == "__main__":
             plt.pause(1e-10)
             fig.tight_layout()
             plt.show()
+
+        if save_fig:
+            fig.savefig('ui.png')
 
     # while True:
     #     try:

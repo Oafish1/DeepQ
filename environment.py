@@ -1,3 +1,4 @@
+from collections import deque
 import random
 
 import matplotlib.pyplot as plt
@@ -14,17 +15,17 @@ class balanceStick:
         self.friction_coef = .2
         self.gravity = 9.8
         self.bounds = (-5, 5)
-        self.tickrate = 16
+        self.tickrate = 64
         self.reset()
 
     def reset(self):
-        self.angle = (np.pi / 16) * (np.pi * (np.random.rand() - .5)) + (np.pi / 2)  # Tilt up to pi/16
+        self.angle = (np.pi / 8) * (np.pi * (np.random.rand() - .5)) + (np.pi / 2)  # Tilt up to pi/8
         self.x = 0  # np.random.rand() * (self.bounds[1] - self.bounds[0]) + self.bounds[0]  # Anywhere in bounds
-        self.velocity = 400 * (np.random.rand() - .5)  # -200 to 200
+        self.velocity = 0  # 400 * (np.random.rand() - .5)  # -200 to 200
         self.tip_ang_vel = 0  # 6 * (np.random.rand() - .5)  # -3 to 3
 
         # Return game state
-        return torch.tensor([[self.x, self.angle, self.velocity]]).float()
+        return torch.tensor([[self.x, self.angle]]).float()
 
     def tick(self, force_x):
         # Apply force
@@ -47,6 +48,7 @@ class balanceStick:
             self.velocity = 0
 
         # Approximate angle
+        # asdf: Refine vel to angular velocity approximation
         vel_change = self.velocity - old_velocity
         self.tip_ang_vel += vel_change * np.sin(self.angle) / (self.tickrate * self.length)
 
@@ -59,18 +61,18 @@ class balanceStick:
         self.angle = self.angle % (2 * np.pi)
 
         # Return game state
-        return torch.tensor([[self.x, self.angle, self.velocity]]).float()
+        return torch.tensor([[self.x, self.angle]]).float()
 
     def render(self, ax=None, state=None):
         if state is not None:
-            x, angle, _ = state
+            x, angle = state
         else:
             x, angle = self.x, self.angle
 
         x = (x, x + np.cos(angle))
         y = (0, np.sin(angle))
         if ax is not None:
-            ax.plot(x, y, 'g-', linewidth=2, markersize=10)
+            ax.plot(x, y, 'g-', linewidth=3, markersize=10)
             ax.set_aspect('equal', 'box')
             ax.set(xlim=self.bounds, ylim=(-.1, self.length))
 
@@ -79,17 +81,17 @@ class balanceStick:
 
 class Agent(nn.Module):
     """Thin, simple NN model"""
-    def __init__(self, input_dim, output_dim, hidden_dim=10):
+    def __init__(self, input_dim, output_dim, hidden_dim=20):
         super().__init__()
 
         self.layers = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LeakyReLU(),
 
-            nn.Linear(hidden_dim, input_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(),
 
-            nn.Linear(input_dim, output_dim),
+            nn.Linear(hidden_dim, output_dim),
         )
 
     def forward(self, x):
@@ -99,51 +101,62 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     # Params
-    headless = True
-    replay_best = True
-    replay_best_interval = 100
-    show_plt = not headless or replay_best
+    show_preview = False
+    show_best_replay = True
+    best_replay_interval = 100
 
-    training_plot = True
-    training_plot_interval = 10
+    show_training_plot = True
+    show_avg_loss = True
+    stat_interval = 10
 
+    show_plt = show_preview or show_best_replay or show_training_plot or show_avg_loss
     cli_print_interval = 50
 
     # Env setup
     env = balanceStick()
-    fig, (ax_env, ax_plot) = plt.subplots(2, 1)
     if show_plt:
+        num_subplots = show_preview + show_best_replay + show_training_plot + show_avg_loss
+        fig, axs = plt.subplots(num_subplots, 1)
+        fig.tight_layout()
         plt.ion()
         plt.show()
 
     # Model setup
-    model = Agent(3, 5)
+    model = Agent(2, 5)
     model.train()
     optimizer = torch.optim.AdamW(model.parameters())
-    criterion = nn.MSELoss()
-    q_model = Agent(3, 5)
+    q_model = Agent(2, 5)
     q_model.eval()
 
     # Hyperparams
     model_train_interval = 4
     q_model_train_interval = 100
-    lambda_coef = .95
-    max_epsilon, min_epsilon = 1, .3
-    decay = .002
-    batch_size = 32
+    lambda_coef = .7
+    max_epsilon, min_epsilon = 1, .01
+    decay = .01
+    batch_size = 128
     q_lr = .7
 
     epsilon = max_epsilon
     best_ticks = []
+    avg_loss = []
+    replay_memory = deque(maxlen=50_000)
     task = None
-    for epoch in range(1001):
+
+    # epoch = -1
+    # while True:
+    #     epoch += 1
+    for epoch in range(500):
+        # Setup
+        plot_idx = 0
+
         # CLI
         if epoch % cli_print_interval == 0:
             print(f'Epoch {epoch}\nEpsilon: {epsilon}')
 
         # Step
         max_ticks = 0
-        replay_memory = []
+        avg_loss.append([])
         for step in range(q_model_train_interval):
             # Reset env
             state = env.reset()
@@ -166,18 +179,22 @@ if __name__ == "__main__":
                 ticks += 1
 
                 # Render
-                if not headless:
-                    ax_env.cla()
-                    env.render(ax=ax_env)
-                    ax_env.title(f'Epoch {epoch}')
+                if show_preview:
+                    axs[plot_idx].cla()
+                    env.render(ax=axs[plot_idx])
+                    axs[plot_idx].title(f'Epoch {epoch}')
                     plt.pause(1e-10)
-                    exit()
+
+            # Bookkeeping
+            if show_preview:
+                plot_idx += 1
 
             # End memory
             if ticks > max_ticks:
                 max_ticks = ticks
                 max_tick_memory = []
-                for transition in replay_memory[::-1]:
+                for idx in range(len(replay_memory))[::-1]:
+                    transition = replay_memory[idx]
                     if transition[4]:
                         break
                     max_tick_memory.append(transition[0][0].detach())
@@ -185,7 +202,7 @@ if __name__ == "__main__":
             replay_memory[-1][-1] = True
 
             # Update main network
-            if (step+1) % 4 == 0 and len(replay_memory) > batch_size * 2:
+            if (step+1) % model_train_interval == 0 and len(replay_memory) > 1_000:
                 mini_batch = random.sample(replay_memory, batch_size)
                 current_states = torch.stack([transition[0][0] for transition in mini_batch], dim=0)
                 new_states = torch.stack([transition[3][0] for transition in mini_batch], dim=0)
@@ -205,9 +222,10 @@ if __name__ == "__main__":
 
                     desired_q = current_q.clone().detach()
                     desired_q[idx] = (1-q_lr) * desired_q[idx] + q_lr * max_q
-                    loss = loss + criterion(current_q, desired_q)
+                    loss += ((desired_q - current_q)**2).mean()
                 loss.backward()
                 optimizer.step()
+                avg_loss[-1].append(loss.detach())
 
         # Update target network
         q_model.load_state_dict(model.state_dict())
@@ -220,20 +238,53 @@ if __name__ == "__main__":
             print(f'Max Ticks: {max_ticks}\n')
 
         # Replay best
-        if replay_best and epoch % replay_best_interval == 0:
+        if show_best_replay and epoch % best_replay_interval == 0:
             for state in max_tick_memory:
-                ax_env.cla()
-                env.render(ax=ax_env, state=state)
-                ax_env.set_title(f'Epoch {epoch}')
+                axs[plot_idx].cla()
+                env.render(ax=axs[plot_idx], state=state)
+                axs[plot_idx].set_title(f'Epoch {epoch}')
                 plt.pause(1/env.tickrate)
+        if show_best_replay:
+            plot_idx += 1
 
         # Best ticks plot
         best_ticks.append(max_ticks)
-        if training_plot and epoch % training_plot_interval == 0:
-            ax_plot.cla()
-            ax_plot.plot(best_ticks, color='orange')
-            ax_plot.set(xlabel='Epoch', ylabel='Best Ticks')
+        if show_training_plot and epoch % stat_interval == 0:
+            smoothed_ticks = []
+            smoothed_ticks.append(best_ticks[0])
+            for i in range(0, len(best_ticks), 10):
+                smoothed_ticks.append(sum(best_ticks[i:(i+10)])/10)
+
+            axs[plot_idx].cla()
+            axs[plot_idx].plot(best_ticks, color='orange')
+            axs[plot_idx].plot(range(0, len(best_ticks), 10),
+                         smoothed_ticks[:-1],
+                         color='blue')
+            axs[plot_idx].set(xlabel='Epoch', ylabel='Best Ticks', title='Highscore')
+        if show_training_plot:
+            plot_idx += 1
+
+        # Average loss plot
+        avg_loss[-1] = sum(avg_loss[-1]) / len(avg_loss[-1])
+        if show_avg_loss and epoch % stat_interval == 0:
+            smoothed_loss = []
+            smoothed_loss.append(avg_loss[0])
+            for i in range(0, len(avg_loss), 10):
+                smoothed_loss.append(sum(avg_loss[i:(i+10)])/10)
+
+            axs[plot_idx].cla()
+            axs[plot_idx].plot(avg_loss, color='orange')
+            axs[plot_idx].plot(range(0, len(avg_loss), 10),
+                         smoothed_loss[:-1],
+                         color='blue')
+            axs[plot_idx].set(xlabel='Epoch', ylabel='Average Loss', title='Loss')
+        if show_avg_loss:
+            plot_idx += 1
+
+        if show_plt:
             plt.pause(1e-10)
+            fig.tight_layout()
+            plt.show()
 
     # while True:
     #     try:
